@@ -331,22 +331,28 @@ def risk_return_scatter(metrics: pd.DataFrame, names: Dict[str, str],
 # Allocation
 # ---------------------------------------------------------------------------
 def allocation_bars(allocation: pd.Series, names: Dict[str, str]) -> Optional[go.Figure]:
+    """Full allocation — every position in the book, one per row, sorted
+    largest-first. Scales in height like the ranking charts so a 100-name book
+    stays legible (scroll the plot)."""
     a = allocation[allocation.index.notna() & allocation.notna() & (allocation > 0)]
     if a.empty:
         return None
     a = a.sort_values(ascending=True)
     labels = [names.get(t, t) for t in a.index]
+    # Shade by weight so the eye reads the concentration gradient down the list.
+    vmax = float(a.max()) if a.max() > 0 else 1.0
+    colors = [f"rgba(58,110,165,{0.45 + 0.55 * (v / vmax):.3f})" for v in a.values]
     fig = go.Figure()
     fig.add_bar(
         x=a.values, y=labels, orientation="h",
-        marker=dict(color=ACCENT, line=dict(width=0)),
+        marker=dict(color=colors, line=dict(width=0)),
         text=[f"{v:.1f}%" for v in a.values], textposition="outside",
-        textfont=dict(size=11, color=INK), cliponaxis=False,
+        textfont=dict(size=10, color=INK), cliponaxis=False,
         customdata=list(a.index),
         hovertemplate="<b>%{y}</b> (%{customdata})<br>Weight: %{x:.2f}%<extra></extra>",
     )
     fig.update_layout(_base_layout(
-        f"Suggested allocation — {len(a)} positions", _row_height(len(a)),
+        f"Suggested allocation — all {len(a)} positions", _row_height(len(a)),
         x_title="Weight (%)"))
     fig.update_yaxes(autorange="reversed")
     return fig
@@ -379,9 +385,11 @@ def allocation_donut(allocation: pd.Series, names: Dict[str, str],
         textfont=dict(size=11, color=INK),
         hovertemplate="<b>%{label}</b><br>%{value:.1f}%<extra></extra>",
     ))
+    n_total = int((allocation > 0).sum())
+    extra = f" of {n_total}" if n_total > top else ""
     fig.update_layout(
-        title=dict(text="Concentration — top positions", font=dict(size=17, color=INK),
-                   x=0, xanchor="left"),
+        title=dict(text=f"Concentration — top {min(top, n_total)}{extra}",
+                   font=dict(size=17, color=INK), x=0, xanchor="left"),
         height=460, margin=dict(l=10, r=10, t=58, b=10),
         paper_bgcolor=BG, plot_bgcolor=BG, font=FONT, showlegend=False)
     return fig

@@ -52,7 +52,7 @@ def parse_universe(text: str) -> List[str]:
 
 @st.cache_data(show_spinner=False, ttl=core.PRICE_TTL)
 def _run_pipeline(tickers_key: str, period: str, risk_free: float,
-                  max_weight: float, force: bool):
+                  max_weight: float, zero_out: bool, force: bool):
     """Cached end-to-end run. tickers_key is the sorted comma list so the same
     universe reuses results. `force` busts by being part of the args."""
     tickers = tickers_key.split(",")
@@ -76,7 +76,8 @@ def _run_pipeline(tickers_key: str, period: str, risk_free: float,
 
     caps = (pd.to_numeric(fundamentals["Market Cap ($B)"], errors="coerce")
             if "Market Cap ($B)" in fundamentals.columns else None)
-    allocation = core.compute_allocation(metrics, max_weight=max_weight / 100.0)
+    allocation = core.compute_allocation(metrics, max_weight=max_weight / 100.0,
+                                          zero_out=zero_out)
 
     return {
         "price": price, "fundamentals": fundamentals, "profiles": profiles,
@@ -90,31 +91,59 @@ def _run_pipeline(tickers_key: str, period: str, risk_free: float,
 # ---------------------------------------------------------------------------
 with st.sidebar:
     st.header("Universe")
-    st.caption("One ticker per line or comma-separated. Add anything you like — "
-               "the list below is just the default.")
+    st.caption("Pick from the default list, or add your own tickers. "
+               "Benchmark **SPY** is always included.")
 
-    if "universe_text" not in st.session_state:
-        st.session_state.universe_text = "\n".join(DEFAULT_TICKERS)
+    # Custom tickers the user has added beyond the default list live here so
+    # they survive selection changes and appear as options too.
+    if "custom_tickers" not in st.session_state:
+        st.session_state.custom_tickers = []
+    if "selected_tickers" not in st.session_state:
+        st.session_state.selected_tickers = list(DEFAULT_TICKERS)
 
-    add_box = st.text_input("Quick add", placeholder="e.g. TSLA, PLTR, ASML",
-                            help="Type one or more symbols and press Add.")
+    # --- add your own -------------------------------------------------------
+    add_box = st.text_input("Add tickers", placeholder="e.g. TSLA, PLTR, ASML",
+                            help="Type one or more symbols (or paste a list) and press Add. "
+                                 "They join the selection and the option list below.")
     c_add, c_reset = st.columns(2)
     if c_add.button("➕ Add", use_container_width=True) and add_box.strip():
-        current = parse_universe(st.session_state.universe_text)
         new = parse_universe(add_box)
-        merged = list(dict.fromkeys(current + new))
-        st.session_state.universe_text = "\n".join(merged)
+        # register as custom options and select them
+        for t in new:
+            if t not in DEFAULT_TICKERS and t not in st.session_state.custom_tickers:
+                st.session_state.custom_tickers.append(t)
+        merged = list(dict.fromkeys(st.session_state.selected_tickers + new))
+        st.session_state.selected_tickers = merged
         st.rerun()
-    if c_reset.button("↺ Reset to default", use_container_width=True):
-        st.session_state.universe_text = "\n".join(DEFAULT_TICKERS)
+    if c_reset.button("↺ Reset", use_container_width=True,
+                      help="Reselect the full default list and clear custom additions."):
+        st.session_state.custom_tickers = []
+        st.session_state.selected_tickers = list(DEFAULT_TICKERS)
         st.rerun()
 
-    universe_text = st.text_area(
-        "Tickers", key="universe_text", height=260,
-        help="Edit freely — remove names, paste your own list, reorder.")
+    # --- the selectable universe -------------------------------------------
+    options = list(dict.fromkeys(list(DEFAULT_TICKERS) + st.session_state.custom_tickers))
+    # keep any previously-selected tickers valid as options
+    for t in st.session_state.selected_tickers:
+        if t not in options:
+            options.append(t)
 
-    tickers = parse_universe(universe_text)
-    st.caption(f"**{len(tickers)}** tickers selected · benchmark **SPY** added automatically.")
+    c_all, c_none = st.columns(2)
+    if c_all.button("Select all", use_container_width=True):
+        st.session_state.selected_tickers = list(options)
+        st.rerun()
+    if c_none.button("Clear all", use_container_width=True):
+        st.session_state.selected_tickers = []
+        st.rerun()
+
+    selected = st.multiselect(
+        "Tickers", options=options,
+        default=None, key="selected_tickers",
+        help="The default EasyEquities list is pre-selected. Deselect any you "
+             "don't want, or add more above.")
+
+    tickers = list(dict.fromkeys(selected))
+    st.caption(f"**{len(tickers)}** of {len(options)} selected · benchmark **SPY** added automatically.")
 
     st.divider()
     st.header("Assumptions")
@@ -125,6 +154,12 @@ with st.sidebar:
                                 help="Subtracted from returns before computing Sharpe.")
     max_weight = st.slider("Max position size (%)", 5, 100, int(core.DEFAULT_MAX_WEIGHT),
                            step=5, help="Caps concentration; the excess is redistributed pro-rata.")
+    zero_out = not st.checkbox(
+        "Allocate to every scored stock", value=True,
+        help="On: every stock that could be scored gets a weight (best names "
+             "biggest, weakest smallest) — the allocation chart covers the whole "
+             "list. Off: only the strongest names are held; small and thin-history "
+             "positions drop to zero for a tighter book.")
 
     st.divider()
     force = st.checkbox("Refresh data (bypass cache)", value=False,
@@ -172,7 +207,7 @@ if force:
     _run_pipeline.clear()
 t0 = time.perf_counter()
 with st.spinner(f"Fetching and scoring {len(tickers)} tickers over {period}…"):
-    result = _run_pipeline(tickers_key, period, risk_free, max_weight, force)
+    result = _run_pipeline(tickers_key, period, risk_free, max_weight, zero_out, force)
 elapsed = time.perf_counter() - t0
 
 if "error" in result:
@@ -219,11 +254,15 @@ late = [t for t in core.late_starters(price) if t != BENCHMARK_TICKER]
 if late:
     notes.append(f"Partial history: **{', '.join(names.get(t, t) for t in late)}** — "
                  "their total return covers a shorter window; use *Excess vs Bench*.")
-scored = set(allocation.index)
-skipped = [t for t in metrics.index if t != BENCHMARK_TICKER and t not in scored]
+held_set = set(allocation[allocation > 0].index)
+skipped = [t for t in metrics.index if t != BENCHMARK_TICKER and t not in held_set]
 if skipped:
-    notes.append(f"Excluded from allocation: **{', '.join(names.get(t, t) for t in skipped)}** "
-                 f"(under {core.MIN_COVERAGE:.0f}% of benchmark sessions or missing risk metrics).")
+    if zero_out:
+        notes.append(f"Excluded from allocation: **{', '.join(names.get(t, t) for t in skipped)}** "
+                     f"(under {core.MIN_COVERAGE:.0f}% of benchmark sessions or missing risk metrics).")
+    else:
+        notes.append(f"Given only a floor weight (thin history / missing risk metrics): "
+                     f"**{', '.join(names.get(t, t) for t in skipped) or '—'}**.")
 pe_missing = [t for t in metrics.index if t != BENCHMARK_TICKER
               and (pd.isna(metrics.loc[t, "P/E Ratio"]) or metrics.loc[t, "P/E Ratio"] <= 0)]
 if pe_missing:
@@ -237,62 +276,36 @@ if notes:
 st.caption(f"⏱ {elapsed:.1f}s · {len(live)} priced · Sharpe uses a {risk_free:.2f}% risk-free rate · "
            "cached runs are near-instant.")
 
-# ---------------------------------------------------------------------------
-# Allocation — the headline output
-# ---------------------------------------------------------------------------
-st.subheader("Suggested portfolio allocation")
-if allocation.empty or held.empty:
-    st.warning("No positions cleared the coverage and risk filters for this universe/period.")
-else:
-    ac1, ac2 = st.columns([2, 1])
-    with ac1:
-        st.plotly_chart(charts.allocation_bars(allocation, names),
-                        use_container_width=True, config={"displayModeBar": False})
-    with ac2:
-        st.plotly_chart(charts.allocation_donut(allocation, names),
-                        use_container_width=True, config={"displayModeBar": False})
-
-    alloc_table = (held.sort_values(ascending=False).rename("Weight (%)")
-                   .reset_index().rename(columns={"index": "Ticker"}))
-    alloc_table["Company"] = alloc_table["Ticker"].map(names).fillna(alloc_table["Ticker"])
-    alloc_table = alloc_table[["Ticker", "Company", "Weight (%)"]]
-    st.download_button("⬇ Download allocation (CSV)",
-                       alloc_table.to_csv(index=False).encode(),
-                       file_name="suggested_allocation.csv", mime="text/csv")
+# ===========================================================================
+# The flow mirrors the original app: supporting / decision charts first, then
+# the portfolio allocation as the culmination at the bottom.
+# ===========================================================================
 
 # ---------------------------------------------------------------------------
-# Risk vs return
-# ---------------------------------------------------------------------------
-st.subheader("Risk vs return")
-scatter = charts.risk_return_scatter(metrics, names, market_caps=caps, allocation=allocation)
-if scatter is not None:
-    st.plotly_chart(scatter, use_container_width=True,
-                    config={"displayModeBar": True, "displaylogo": False})
-
-# ---------------------------------------------------------------------------
-# Price performance
+# 1. Price performance
 # ---------------------------------------------------------------------------
 st.subheader("Price performance")
-st.caption("Every name in one muted line; the benchmark and your top-8 allocations are "
-           "highlighted. Hover any line to identify it, or use the legend-free zoom.")
-hl = held.sort_values(ascending=False).head(8).index.tolist()
+st.caption("Every name in one muted line; the benchmark and your largest allocations are "
+           "highlighted. Hover any line to identify it, or box-zoom into a cluster.")
+hl = held.sort_values(ascending=False).head(8).index.tolist() if not held.empty else []
 perf = charts.price_performance(price, price_view, names, highlight=hl)
 if perf is not None:
     st.plotly_chart(perf, use_container_width=True,
                     config={"displayModeBar": True, "displaylogo": False})
 
 # ---------------------------------------------------------------------------
-# Ranking charts
+# 2. Decision / ranking charts  (P/E, momentum, volatility, drawdown, Sharpe,
+#    total return) — same set the original app surfaced.
 # ---------------------------------------------------------------------------
-st.subheader("Rankings")
+st.subheader("Decision charts")
 st.caption("Each name on its own row, sorted, with the SPY benchmark marked. "
            "Long lists make these tall — scroll within a tab.")
 
-tabs = st.tabs(["Total return", "Sharpe", "Volatility", "Max drawdown",
-                "Momentum (SMA)", "Valuation (P/E)"])
+tabs = st.tabs(["Valuation (P/E)", "Momentum (SMA)", "Volatility", "Max drawdown",
+                "Sharpe", "Total return"])
 chart_fns = [
-    charts.total_return_bars, charts.sharpe_bars, charts.volatility_bars,
-    charts.drawdown_bars, charts.sma_bars, charts.pe_bars,
+    charts.pe_bars, charts.sma_bars, charts.volatility_bars,
+    charts.drawdown_bars, charts.sharpe_bars, charts.total_return_bars,
 ]
 for tab, fn in zip(tabs, chart_fns):
     with tab:
@@ -302,6 +315,38 @@ for tab, fn in zip(tabs, chart_fns):
         else:
             st.plotly_chart(fig, use_container_width=True,
                             config={"displayModeBar": False})
+
+# ---------------------------------------------------------------------------
+# 3. Risk vs return scatter
+# ---------------------------------------------------------------------------
+st.subheader("Risk vs return")
+scatter = charts.risk_return_scatter(metrics, names, market_caps=caps, allocation=allocation)
+if scatter is not None:
+    st.plotly_chart(scatter, use_container_width=True,
+                    config={"displayModeBar": True, "displaylogo": False})
+
+# ---------------------------------------------------------------------------
+# 4. Suggested portfolio allocation — the culmination
+# ---------------------------------------------------------------------------
+st.subheader("Suggested portfolio allocation")
+if allocation.empty or held.empty:
+    st.warning("No positions cleared the filters for this universe/period.")
+else:
+    st.caption(f"Every scored stock gets a weight — best names biggest — across all "
+               f"**{len(held)}** positions." if not zero_out else
+               f"Tighter book: only the strongest **{len(held)}** names are held.")
+    st.plotly_chart(charts.allocation_bars(allocation, names),
+                    use_container_width=True, config={"displayModeBar": False})
+    st.plotly_chart(charts.allocation_donut(allocation, names),
+                    use_container_width=True, config={"displayModeBar": False})
+
+    alloc_table = (held.sort_values(ascending=False).rename("Weight (%)")
+                   .reset_index().rename(columns={"index": "Ticker"}))
+    alloc_table["Company"] = alloc_table["Ticker"].map(names).fillna(alloc_table["Ticker"])
+    alloc_table = alloc_table[["Ticker", "Company", "Weight (%)"]]
+    st.download_button("⬇ Download allocation (CSV)",
+                       alloc_table.to_csv(index=False).encode(),
+                       file_name="suggested_allocation.csv", mime="text/csv")
 
 # ---------------------------------------------------------------------------
 # Detailed table

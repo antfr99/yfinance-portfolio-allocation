@@ -836,14 +836,34 @@ def _cap_weights(weights: pd.Series, cap: float) -> pd.Series:
 def compute_allocation(metrics: pd.DataFrame,
                        max_weight: float = DEFAULT_MAX_WEIGHT / 100,
                        min_weight: float = MIN_WEIGHT,
-                       min_coverage: float = MIN_COVERAGE) -> pd.Series:
+                       min_coverage: float = MIN_COVERAGE,
+                       zero_out: bool = False) -> pd.Series:
+    """Score-weighted allocation.
+
+    zero_out=False (default): every scored name gets a positive weight. The
+      score still sets the magnitude — best names biggest — but the 2% floor
+      is not applied, and names below the coverage threshold are kept at a
+      small floor weight instead of being dropped. So the allocation chart
+      covers the whole list.
+    zero_out=True: original behaviour — sub-2% and low-coverage names go to 0,
+      giving a tighter book of only the strongest names.
+    """
     df = metrics.copy()
     df = df.drop(index=[BENCHMARK_TICKER], errors="ignore")
     if df.empty:
         return pd.Series(dtype=float)
 
+    # Coverage: in zero_out mode we exclude low-coverage names; otherwise we
+    # keep them but remember which they are so they only get a floor weight
+    # (their Sharpe/momentum are measured over a shorter window, so we don't
+    # want the score to hand them a big position on thin data).
+    low_cov = pd.Series(False, index=df.index)
     if "Coverage (%)" in df.columns:
-        df = df[pd.to_numeric(df["Coverage (%)"], errors="coerce").fillna(0) >= min_coverage]
+        cov = pd.to_numeric(df["Coverage (%)"], errors="coerce").fillna(0)
+        if zero_out:
+            df = df[cov >= min_coverage]
+        else:
+            low_cov = cov < min_coverage
     if df.empty:
         return pd.Series(dtype=float)
 
@@ -852,9 +872,13 @@ def compute_allocation(metrics: pd.DataFrame,
     pe = pe.fillna(median_pe if not pd.isna(median_pe) else 20.0)
     log_pe = np.log(pe.clip(lower=0.5))
 
-    df = df.dropna(subset=["Sharpe Ratio", "Volatility (Ann %)"])
-    if df.empty:
-        return pd.Series(dtype=float)
+    # In no-zero mode a missing Sharpe/Vol shouldn't drop the name entirely —
+    # give it the neutral middle of each component instead.
+    if zero_out:
+        df = df.dropna(subset=["Sharpe Ratio", "Volatility (Ann %)"])
+        if df.empty:
+            return pd.Series(dtype=float)
+    low_cov = low_cov.reindex(df.index).fillna(False)
 
     sma_cols = [c for c in df.columns if "Diff from SMA" in c]
     if not sma_cols:
@@ -874,14 +898,30 @@ def compute_allocation(metrics: pd.DataFrame,
         - 0.10 * _winsorized_normalize(log_pe.reindex(df.index))
     )
 
-    weight = score.clip(lower=0)
-    if float(weight.sum()) < 1e-9:
-        weight = pd.Series(1.0, index=df.index)
-    weight = weight / weight.sum()
-
-    below_min = weight < min_weight
-    if below_min.any() and not below_min.all():
-        weight[below_min] = 0.0
+    if zero_out:
+        weight = score.clip(lower=0)
+        if float(weight.sum()) < 1e-9:
+            weight = pd.Series(1.0, index=df.index)
+        weight = weight / weight.sum()
+        below_min = weight < min_weight
+        if below_min.any() and not below_min.all():
+            weight[below_min] = 0.0
+            weight = weight / weight.sum()
+    else:
+        # Everyone in. Shift the score so the lowest scorer still gets a
+        # positive share, rather than clipping it to zero. A small epsilon
+        # floor keeps even the weakest name visible on the chart.
+        s = score.astype(float)
+        lo = float(s.min())
+        span = float(s.max() - lo)
+        if span < 1e-9:
+            weight = pd.Series(1.0, index=df.index)
+        else:
+            # Map scores to [0.15, 1.0] so the best name is ~7x the worst,
+            # not infinitely larger. Low-coverage names are pulled toward the
+            # floor so thin data can't earn a big weight.
+            weight = 0.15 + 0.85 * (s - lo) / span
+            weight[low_cov] = weight[low_cov].clip(upper=0.30)
         weight = weight / weight.sum()
 
     weight = _cap_weights(weight, max_weight)
