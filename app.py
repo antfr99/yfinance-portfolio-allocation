@@ -277,37 +277,113 @@ st.caption(f"⏱ {elapsed:.1f}s · {len(live)} priced · Sharpe uses a {risk_fre
            "cached runs are near-instant.")
 
 # ===========================================================================
-# The flow mirrors the original app: supporting / decision charts first, then
-# the portfolio allocation as the culmination at the bottom.
+# Explainer expanders (above the tabs), then every chart inside one tab set.
 # ===========================================================================
 
-# ---------------------------------------------------------------------------
-# 1. Price performance
-# ---------------------------------------------------------------------------
-st.subheader("Price performance")
-st.caption("Every name in one muted line; the benchmark and your largest allocations are "
-           "highlighted. Hover any line to identify it, or box-zoom into a cluster.")
-hl = held.sort_values(ascending=False).head(8).index.tolist() if not held.empty else []
-perf = charts.price_performance(price, price_view, names, highlight=hl)
-if perf is not None:
-    st.plotly_chart(perf, use_container_width=True,
-                    config={"displayModeBar": True, "displaylogo": False})
+with st.expander("📘 How the allocation is scored"):
+    st.markdown(f"""
+**Score = 0.40 × Sharpe + 0.30 × Momentum − 0.12 × Volatility − 0.08 × Max Drawdown − 0.10 × P/E**
 
-# ---------------------------------------------------------------------------
-# 2. Decision / ranking charts  (P/E, momentum, volatility, drawdown, Sharpe,
-#    total return) — same set the original app surfaced.
-# ---------------------------------------------------------------------------
-st.subheader("Decision charts")
-st.caption("Each name on its own row, sorted, with the SPY benchmark marked. "
-           "Long lists make these tall — scroll within a tab.")
+| Component | Weight | Logic |
+|---|---|---|
+| Sharpe ratio | +40% | Reward per unit of risk — the core quality signal |
+| Momentum (SMA deviation) | +30% | Price above its moving average = positive trend |
+| Volatility | −12% | Penalises erratic names (counts up- and down-moves alike) |
+| Max drawdown | −8% | Penalises the worst peak-to-trough loss actually endured |
+| P/E ratio | −10% | Penalises expensive names (scored on log P/E) |
 
-tabs = st.tabs(["Valuation (P/E)", "Momentum (SMA)", "Volatility", "Max drawdown",
-                "Sharpe", "Total return"])
-chart_fns = [
-    charts.pe_bars, charts.sma_bars, charts.volatility_bars,
-    charts.drawdown_bars, charts.sharpe_bars, charts.total_return_bars,
-]
-for tab, fn in zip(tabs, chart_fns):
+Each component is normalized 0→1 after **winsorizing at the 5th/95th percentile**, so a single
+extreme name can't flatten the spread for everyone else. Anything above your **max position size**
+({max_weight:.0f}%) is capped with the excess redistributed pro-rata, and the whole book
+renormalizes so the **weights sum to 100%**. Missing P/E is imputed with the universe median.
+
+With **"Allocate to every scored stock"** on (default), every stock that can be scored gets a
+positive weight — best names biggest, weakest smallest. With it off, sub-2% and thin-history
+positions drop to zero for a tighter book. Names trading under **{core.MIN_COVERAGE:.0f}%** of the
+benchmark's sessions are either floored (on) or excluded (off).
+
+Metrics are computed on each ticker's *own* trading sessions (no forward-filling across foreign
+market holidays), so volatility and Sharpe aren't distorted for non-US listings.
+
+*Not investment advice.*
+""")
+
+with st.expander("📊 What the charts show"):
+    st.markdown("""
+Each tab is a different lens on the same universe. Bar charts put **one stock per row**, sorted,
+with the **SPY benchmark** drawn as a dashed reference line — long lists get tall, so scroll inside
+the tab.
+
+- **Suggested allocation** — the output. Each stock's weight, largest to smallest. The
+  **weights add up to 100%** (a fully-invested book); the donut shows how concentrated the top
+  positions are.
+- **Risk vs return** — the trade-off view. Up = higher return, right = more risk, so *up-and-left
+  is better*. Bubble size ≈ market cap; blue dots are names in the portfolio; dashed lines mark the
+  benchmark. Above the horizontal line beat SPY; left of the vertical did it with less risk.
+- **Price performance** — every name as one line over the period (benchmark and your top
+  allocations highlighted). Switch Cumulative / Normalized / Absolute in the sidebar.
+- **Valuation (P/E)** — price per dollar of earnings; lower = cheaper. Median marked.
+- **Momentum (SMA)** — % above/below the moving average. Positive = trending up.
+- **Volatility** — annualized swing size; lower = calmer.
+- **Max drawdown** — worst peak-to-trough fall in the window; the loss you'd have sat through.
+- **Sharpe** — return earned per unit of risk, above cash. Higher = better; negative = poor trade-off.
+- **Total return** — simple price change over the period.
+""")
+
+# --- one tab set for everything; allocation first --------------------------
+tab_labels = ["💼 Suggested allocation", "Risk vs return", "Price performance",
+              "Valuation (P/E)", "Momentum (SMA)", "Volatility",
+              "Max drawdown", "Sharpe", "Total return"]
+chart_tabs = st.tabs(tab_labels)
+
+# Tab 1 — Suggested allocation (largest → least)
+with chart_tabs[0]:
+    if allocation.empty or held.empty:
+        st.warning("No positions cleared the filters for this universe/period.")
+    else:
+        st.caption(
+            (f"Every scored stock gets a weight — best names biggest — across all "
+             f"**{len(held)}** positions. Weights sum to 100%.")
+            if not zero_out else
+            (f"Tighter book: only the strongest **{len(held)}** names are held. "
+             f"Weights sum to 100%."))
+        st.plotly_chart(charts.allocation_bars(allocation, names),
+                        use_container_width=True, config={"displayModeBar": False})
+        st.plotly_chart(charts.allocation_donut(allocation, names),
+                        use_container_width=True, config={"displayModeBar": False})
+        alloc_table = (held.sort_values(ascending=False).rename("Weight (%)")
+                       .reset_index().rename(columns={"index": "Ticker"}))
+        alloc_table["Company"] = alloc_table["Ticker"].map(names).fillna(alloc_table["Ticker"])
+        alloc_table = alloc_table[["Ticker", "Company", "Weight (%)"]]
+        st.download_button("⬇ Download allocation (CSV)",
+                           alloc_table.to_csv(index=False).encode(),
+                           file_name="suggested_allocation.csv", mime="text/csv")
+
+# Tab 2 — Risk vs return
+with chart_tabs[1]:
+    scatter = charts.risk_return_scatter(metrics, names, market_caps=caps, allocation=allocation)
+    if scatter is None:
+        st.info("Not enough data for this chart.")
+    else:
+        st.plotly_chart(scatter, use_container_width=True,
+                        config={"displayModeBar": True, "displaylogo": False})
+
+# Tab 3 — Price performance
+with chart_tabs[2]:
+    hl = held.sort_values(ascending=False).head(8).index.tolist() if not held.empty else []
+    perf = charts.price_performance(price, price_view, names, highlight=hl)
+    if perf is None:
+        st.info("Not enough data for this chart.")
+    else:
+        st.caption("Benchmark and your largest allocations are highlighted; every other name is a "
+                   "muted line. Hover to identify, box-zoom into a cluster.")
+        st.plotly_chart(perf, use_container_width=True,
+                        config={"displayModeBar": True, "displaylogo": False})
+
+# Tabs 4-9 — ranking bars
+rank_fns = [charts.pe_bars, charts.sma_bars, charts.volatility_bars,
+            charts.drawdown_bars, charts.sharpe_bars, charts.total_return_bars]
+for tab, fn in zip(chart_tabs[3:], rank_fns):
     with tab:
         fig = fn(metrics, names)
         if fig is None:
@@ -315,38 +391,6 @@ for tab, fn in zip(tabs, chart_fns):
         else:
             st.plotly_chart(fig, use_container_width=True,
                             config={"displayModeBar": False})
-
-# ---------------------------------------------------------------------------
-# 3. Risk vs return scatter
-# ---------------------------------------------------------------------------
-st.subheader("Risk vs return")
-scatter = charts.risk_return_scatter(metrics, names, market_caps=caps, allocation=allocation)
-if scatter is not None:
-    st.plotly_chart(scatter, use_container_width=True,
-                    config={"displayModeBar": True, "displaylogo": False})
-
-# ---------------------------------------------------------------------------
-# 4. Suggested portfolio allocation — the culmination
-# ---------------------------------------------------------------------------
-st.subheader("Suggested portfolio allocation")
-if allocation.empty or held.empty:
-    st.warning("No positions cleared the filters for this universe/period.")
-else:
-    st.caption(f"Every scored stock gets a weight — best names biggest — across all "
-               f"**{len(held)}** positions." if not zero_out else
-               f"Tighter book: only the strongest **{len(held)}** names are held.")
-    st.plotly_chart(charts.allocation_bars(allocation, names),
-                    use_container_width=True, config={"displayModeBar": False})
-    st.plotly_chart(charts.allocation_donut(allocation, names),
-                    use_container_width=True, config={"displayModeBar": False})
-
-    alloc_table = (held.sort_values(ascending=False).rename("Weight (%)")
-                   .reset_index().rename(columns={"index": "Ticker"}))
-    alloc_table["Company"] = alloc_table["Ticker"].map(names).fillna(alloc_table["Ticker"])
-    alloc_table = alloc_table[["Ticker", "Company", "Weight (%)"]]
-    st.download_button("⬇ Download allocation (CSV)",
-                       alloc_table.to_csv(index=False).encode(),
-                       file_name="suggested_allocation.csv", mime="text/csv")
 
 # ---------------------------------------------------------------------------
 # Detailed table
@@ -399,29 +443,3 @@ st.download_button("⬇ Download full metrics (CSV)",
                    display.to_csv(index=False).encode(),
                    file_name="equity_metrics.csv", mime="text/csv")
 
-# ---------------------------------------------------------------------------
-# Methodology
-# ---------------------------------------------------------------------------
-with st.expander("📘 How the allocation is scored"):
-    st.markdown("""
-**Score = 0.40 × Sharpe + 0.30 × Momentum − 0.12 × Volatility − 0.08 × Max Drawdown − 0.10 × P/E**
-
-| Component | Weight | Logic |
-|---|---|---|
-| Sharpe ratio | +40% | Reward per unit of risk — the core quality signal |
-| Momentum (SMA deviation) | +30% | Price above its moving average = positive trend |
-| Volatility | −12% | Penalises erratic names (counts up- and down-moves alike) |
-| Max drawdown | −8% | Penalises the worst peak-to-trough loss actually endured |
-| P/E ratio | −10% | Penalises expensive names (scored on log P/E) |
-
-Each component is normalized 0→1 after **winsorizing at the 5th/95th percentile**, so a single
-extreme name can't flatten the spread for everyone else. Positions below **2%** are zeroed,
-anything above your **max position size** is capped with the excess redistributed pro-rata, and
-the rest renormalizes to 100%. Missing P/E is imputed with the universe median. Names trading
-fewer than **60%** of the benchmark's sessions sit the round out.
-
-Metrics are computed on each ticker's *own* trading sessions (no forward-filling across foreign
-market holidays), so volatility and Sharpe aren't distorted for non-US listings.
-
-*Not investment advice.*
-""")
