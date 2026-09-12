@@ -331,30 +331,35 @@ def risk_return_scatter(metrics: pd.DataFrame, names: Dict[str, str],
 # Allocation
 # ---------------------------------------------------------------------------
 def allocation_bars(allocation: pd.Series, names: Dict[str, str]) -> Optional[go.Figure]:
-    """Full allocation — every position in the book, one per row, sorted
-    largest-first. Scales in height like the ranking charts so a 100-name book
+    """Full allocation — every position in the book, one per row, largest at the
+    TOP going down. Scales in height like the ranking charts so a 100-name book
     stays legible (scroll the plot)."""
     a = allocation[allocation.index.notna() & allocation.notna() & (allocation > 0)]
     if a.empty:
         return None
-    a = a.sort_values(ascending=True)
-    labels = [names.get(t, t) for t in a.index]
-    # Shade by weight so the eye reads the concentration gradient down the list.
-    vmax = float(a.max()) if a.max() > 0 else 1.0
-    colors = [f"rgba(58,110,165,{0.45 + 0.55 * (v / vmax):.3f})" for v in a.values]
+    # Sort largest-first. Plotly draws the first category at the bottom, so to
+    # get largest-at-top we feed it smallest-first and pin the category order.
+    a_desc = a.sort_values(ascending=False)          # largest -> smallest
+    a_plot = a_desc.iloc[::-1]                        # smallest -> largest (draw order)
+    labels = [names.get(t, t) for t in a_plot.index]
+    order = [names.get(t, t) for t in a_desc.index]  # top -> bottom = largest -> smallest
+    vmax = float(a_plot.max()) if a_plot.max() > 0 else 1.0
+    colors = [f"rgba(58,110,165,{0.45 + 0.55 * (v / vmax):.3f})" for v in a_plot.values]
     fig = go.Figure()
     fig.add_bar(
-        x=a.values, y=labels, orientation="h",
+        x=a_plot.values, y=labels, orientation="h",
         marker=dict(color=colors, line=dict(width=0)),
-        text=[f"{v:.1f}%" for v in a.values], textposition="outside",
+        text=[f"{v:.1f}%" for v in a_plot.values], textposition="outside",
         textfont=dict(size=10, color=INK), cliponaxis=False,
-        customdata=list(a.index),
+        customdata=list(a_plot.index),
         hovertemplate="<b>%{y}</b> (%{customdata})<br>Weight: %{x:.2f}%<extra></extra>",
     )
     fig.update_layout(_base_layout(
-        f"Suggested allocation — all {len(a)} positions", _row_height(len(a)),
+        f"Suggested allocation — all {len(a_plot)} positions", _row_height(len(a_plot)),
         x_title="Weight (%)"))
-    fig.update_yaxes(autorange="reversed")
+    # Pin the row order explicitly (largest at top) — robust regardless of how
+    # Plotly merges the base layout's yaxis settings.
+    fig.update_yaxes(categoryorder="array", categoryarray=list(reversed(order)))
     return fig
 
 
